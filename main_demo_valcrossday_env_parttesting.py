@@ -20,6 +20,7 @@ from tqdm import tqdm
 from triplet_loader import TripletLoader
 from plot_confusion_matrix import plot_confusion_matrix
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn import manifold
 
 #training parameters
 parser = argparse.ArgumentParser(description='GKP training, fine_tune parameters')
@@ -27,7 +28,7 @@ parser.add_argument('--batch_size', type=int, default=32, metavar='N', help='bat
 parser.add_argument('--epochs', type=int, default=150, metavar='N', help='# of epochs for training (150)')
 parser.add_argument('--epochs2', type=int, default=200, metavar='N', help='# of epochs for tuning (150)')
 parser.add_argument('--momentum', type=float, default=0.9, metavar='M', help='SGD momentum (0.9)')
-parser.add_argument('--lr', type=float, default=5e-4, metavar='N', help='learning rate (0.02)')
+parser.add_argument('--lr', type=float, default=1e-4, metavar='N', help='learning rate (0.02)')
 parser.add_argument('--lr2', type=float, default=1e-4, metavar='N', help='learning rate (0.02)')
 parser.add_argument('--margin', type=float, default=1, metavar='N', help='margin of triplet loss (?)')
 parser.add_argument('--alpha', type=float, default=0.5, metavar='N', help='weight for KLDLoss (?)')
@@ -69,8 +70,6 @@ def train(netFE, netTask, netEnv, dataloader, optTask, optEnv, netEnvClass, optE
         
         '''environment phase'''
         eP, eA, eN = netEnv(fP.detach()), netEnv(fA.detach()), netEnv(fN.detach()) #.detach()
-        #tripLoss = torch.mean(F.relu((torch.pow(torch.dist(eA-eP,2,dim=1),2) - torch.pow(torch.norm(eA-eN,2,axis=1),2) + args.margin)))
-        #tripLoss = torch.mean(F.relu(torch.pow(eA-eP,2) - torch.pow(eA-eN,2) + args.margin)) #, dim=1
         tripLoss = torch.mean(F.relu(torch.norm(eA-eP, dim=1) - torch.norm(eA-eN, dim=1) + args.margin))
         
         #if epoch <= 20:
@@ -82,7 +81,10 @@ def train(netFE, netTask, netEnv, dataloader, optTask, optEnv, netEnvClass, optE
         ecP, ecA, ecN = netEnvClass(eP), netEnvClass(eA), netEnvClass(eN) #.detach()
         x = torch.transpose(torch.stack((ecP,ecA,ecN),dim=1), 1, 2) #batch x env# x 3(P,A,N)     
         envcloss = CE(x,targetsEnv.to(device))
-        #envcloss.backward()
+        
+        loss = tripLoss #+ envcloss
+        #loss.backward()
+        optEnv.step()
         #optEnvClass.step()
         
         '''task phase'''
@@ -90,8 +92,6 @@ def train(netFE, netTask, netEnv, dataloader, optTask, optEnv, netEnvClass, optE
         eP, eA, eN = netEnv(fP), netEnv(fA), netEnv(fN)         
       
         '''stack shape : batch_size *2 '''
-        #stack_norm = torch.stack((torch.sum(torch.pow((eA-eP),2), dim=1), torch.sum(torch.pow((eA-eN),2), dim=1)), dim=1)
-        #stack_norm = torch.stack((torch.mean(torch.pow((eA-eP),2), dim=1), torch.mean(torch.pow((eA-eN),2), dim=1)), dim=1)
         stack_norm = torch.stack((torch.norm(eA-eP, dim=1), torch.norm(eA-eN, dim=1)), dim=1)
         tripletLoss = KLD(F.log_softmax(stack_norm, dim=1), (torch.ones(stack_norm.shape)*0.5).to(device))
         #tripletLoss = torch.mean(torch.norm(eP-eN, dim=1)).to(device)
@@ -100,13 +100,16 @@ def train(netFE, netTask, netEnv, dataloader, optTask, optEnv, netEnvClass, optE
         y = targets.view(x.shape[0],1).repeat(1,3)
         
         CEloss, alphaloss = CE(x,y), args.alpha * tripletLoss
-        #loss = CE(x,y) + args.alpha * tripletLoss
+        loss = CEloss + alphaloss
+        loss.backward()
+        optTask.step()
+        '''
         if epoch > args.epoch_change:
-            loss = CEloss + alphaloss + tripLoss#- envcloss #
+            loss = CEloss + alphaloss #+ tripLoss#- envcloss #
             
             loss.backward()
             optTask.step()
-            optEnv.step()
+            #optEnv.step()
         else:
             loss = CEloss  + tripLoss + envcloss
         
@@ -114,8 +117,7 @@ def train(netFE, netTask, netEnv, dataloader, optTask, optEnv, netEnvClass, optE
             optEnv.step() #
             optEnvClass.step() #
             optTask.step()
-            
-        #Task_loss += loss.item()
+         '''
         Task_loss += CEloss.item()
         Alphaloss += alphaloss.item()
 
@@ -128,7 +130,6 @@ def train(netFE, netTask, netEnv, dataloader, optTask, optEnv, netEnvClass, optE
     with torch.no_grad():
         f = netFE(data.to(device))
         predTask = netTask(f).data.max(1)[1]
-        predEnv = netEnv(f)
         predEnvC = netEnvClass(netEnv(f)).data.max(1)[1]
         
     #training accuracy
@@ -140,14 +141,8 @@ def train(netFE, netTask, netEnv, dataloader, optTask, optEnv, netEnvClass, optE
     l_tr_Env = Env_loss / batch_idx
     l_tr_Alpha = Alphaloss / batch_idx
     
-    if epoch % 30 ==0:
-        predEnvs, normEnv = [],[]
-        ax = plt.subplot(111)
-        for i in range(len(np.unique(env))):
-            predEnvs.append(predEnv[env==i])
-            normEnv.append(torch.norm(predEnvs[i], dim=1))
-            ax.scatter([i]*len(np.array(normEnv[i].detach().cpu())),np.array(normEnv[i].detach().cpu()))
-        plt.show()
+    if epoch % 40 ==0:
+        show_TSNE(dataloader, netFE, netEnv)
     
     return c_tr_Task, c_tr_Env, l_tr_Task, l_tr_Env, l_tr_Alpha
 
@@ -185,6 +180,7 @@ def train_model(netFE, netTask, netEnv, epoch, tr_loader, te_loader, correct_ori
 
         statFE = netFE.state_dict()
         statTask = netTask.state_dict()
+        statEnv = netEnv.state_dict()
         #savefilename = 'model_demo_crosstime/result'+mode+'.tar'
         filenameFE = 'model/FE_'+str(epoch)+'_'+str(correct_ori)+'.tar'
         filenameTask = 'model/Task_'+str(epoch)+'_'+str(correct_ori)+'.tar'
@@ -199,20 +195,23 @@ def train_model(netFE, netTask, netEnv, epoch, tr_loader, te_loader, correct_ori
             'epoch': epoch,
             'state_dict': statTask,  #instead of saving whole model, only saving parameters
         }, filenameTask)
+    
+        torch.save({
+            'epoch': epoch,
+            'state_dict': statEnv,  #instead of saving whole model, only saving parameters
+        }, filenameEnv)       
 
         save = [filenameFE, filenameTask, filenameEnv]
     
     return correctTask, correctEnv, correct_ori, save, c_tr_Task, c_tr_Env, l_tr_Task, l_tr_Env, lossTask, lossEnv, l_tr_Alpha
 
-def get_best_model(netFE, netTask, f0, f1):
+def get_best_model(netFE, netTask, netEnv, f0, f1, f2):
     tar = torch.load(f0)
     netFE.load_state_dict(tar['state_dict'])
     tar = torch.load(f1)
     netTask.load_state_dict(tar['state_dict'])
-
-def get_model_on_cpu(m0,f0):
-    device2 = torch.device('cpu')
-    m0.load_state_dict(torch.load(best, map_location=device2)['state_dict'])
+    tar = torch.load(f2)
+    netEnv.load_state_dict(tar['state_dict']) 
 
 def save_performance(p):
     import csv
@@ -228,6 +227,21 @@ def adjust_lr_rate(optimizer, loss, times):
       for param_group in optimizer.param_groups:
           param_group['lr'] *= 0.1
   return times
+
+def show_TSNE(loader, modelFE, modelEnv):
+    data = loader.dataset.data
+    feature = modelEnv(modelFE(torch.FloatTensor(data).to(device)))
+    env = train_loader.dataset.env
+    T = manifold.TSNE(n_components=2, init='pca', random_state=0)
+    Yfeature = T.fit_transform(feature.cpu().data.numpy())
+    
+    f = plt.figure(figsize=(8,8))
+    ax = f.add_subplot(111)
+    for i, s in zip([0, 1, 2, 3, 4, 5, 6, 7], [0,1,2,3,4,5,6,7]):
+        ax.scatter(Yfeature[env == i, 0], Yfeature[env == i, 1], alpha=.8, lw=0.2, label=str(s))
+    ax.legend()
+    ax.grid(True)
+    plt.show()
 
 def make_weights(label):
     num_classes = np.unique(label)[-1]+1
@@ -380,9 +394,10 @@ for norm_mode in norm_modes:
                     print('lr_decay_times' + str(decay_times))
                 '''
                 if epoch == args.epoch_change:
-                    get_best_model(modelFE, modelTask, best[0], best[1])
+                    get_best_model(modelFE, modelTask, modelEnv, best[0], best[1], best[2])
                 
-                    val_accuracy, val_loss, cmt = finalTest(modelFE, modelTask, test_data, test_label)
+                    val_accuracy, val_loss, cmt = finalTest(modelFE, 
+                                                            modelTask, test_data, test_label)
         
                     print('-------final-------')
                     print('testing accuracy before de-env {}, {} : {}%'.format(norm_mode, test_file[0], str(val_accuracy)))
@@ -413,7 +428,7 @@ for norm_mode in norm_modes:
             plt.title('loss')
             plt.show()
         
-        get_best_model(modelFE, modelTask, best[0], best[1])
+        get_best_model(modelFE, modelTask, modelEnv, best[0], best[1], best[2])
          
         val_accuracy, val_loss, cmt = finalTest(modelFE, modelTask, test_data, test_label)
         
@@ -422,6 +437,3 @@ for norm_mode in norm_modes:
         print(cmt)
         accWOEnv.append(val_accuracy)
         
-        
-        
-####remove 0424_2!!!
